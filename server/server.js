@@ -1,4 +1,3 @@
-// server.js (Completely Fixed Backend)
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -11,6 +10,9 @@ import { dirname } from 'path';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+import { QdrantClient } from "@qdrant/js-client-rest";
 
 dotenv.config();
 
@@ -18,8 +20,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  credentials: true
+}));
+app.use(express.json({ limit: '50mb' }));
 
 // Ensure uploads folder exists
 if (!fs.existsSync("uploads")) {
@@ -47,7 +52,12 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 50 * 1024 * 1024, // 50MB limit
+  }
+});
 
 // Generate unique ID using crypto module
 const generatePdfId = () => {
@@ -56,6 +66,65 @@ const generatePdfId = () => {
 
 // Initialize Google Generative AI
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || "");
+
+// Initialize Qdrant client
+const qdrantClient = new QdrantClient({
+  url: process.env.QDRANT_URL || "http://localhost:6333",
+});
+
+// Enhanced text extraction using PDFLoader only
+async function extractTextFromPDF(filePath) {
+  try {
+    // Use PDFLoader from LangChain for reliable text extraction
+    const loader = new PDFLoader(filePath, {
+      parsedItemSeparator: " ",
+    });
+    
+    const docs = await loader.load();
+    const text = docs.map(doc => doc.pageContent).join(" ");
+    
+    return text;
+  } catch (error) {
+    console.error("Text extraction error:", error);
+    throw new Error("Failed to extract text from PDF");
+  }
+}
+
+// Enhanced text cleaning and structuring
+function cleanAndStructureText(text, pdfType = 'general') {
+  // Remove excessive whitespace
+  let cleaned = text.replace(/\s+/g, ' ').trim();
+  
+  return { text: cleaned, type: pdfType };
+}
+
+// Health check endpoint
+app.get("/health", async (req, res) => {
+  try {
+    // Check Redis connection
+    const redis = new Redis(redisConnection);
+    await redis.ping();
+    
+    // Check Qdrant connection
+    const qdrantResponse = await fetch(`${process.env.QDRANT_URL || "http://localhost:6333"}/collections`);
+    if (!qdrantResponse.ok) {
+      throw new Error("Qdrant connection failed");
+    }
+    
+    return res.json({ 
+      status: "healthy",
+      redis: "connected",
+      qdrant: "connected",
+      googleAI: process.env.GOOGLE_API_KEY ? "configured" : "not configured"
+    });
+  } catch (error) {
+    console.error("Health check failed:", error);
+    return res.status(500).json({ 
+      status: "unhealthy",
+      error: error.message 
+    });
+  }
+});
 
 app.get("/", (req, res) => {
   return res.json({ status: "All Good" });
@@ -66,7 +135,8 @@ app.get("/pdfs", (req, res) => {
   const pdfList = Array.from(pdfCollections.entries()).map(([id, data]) => ({
     id,
     filename: data.filename,
-    uploadedAt: data.uploadedAt
+    uploadedAt: data.uploadedAt,
+    type: data.type || 'general'
   }));
   return res.json(pdfList);
 });
@@ -81,23 +151,35 @@ app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
     // Generate a unique ID for this PDF
     const pdfId = generatePdfId();
     
+    // Extract and analyze text to determine PDF type
+    const extractedText = await extractTextFromPDF(req.file.path);
+    const { text: cleanedText, type: pdfType } = cleanAndStructureText(extractedText);
+    
+    // Store the text temporarily for processing
+    const tempTextPath = `uploads/${pdfId}_temp.txt`;
+    fs.writeFileSync(tempTextPath, cleanedText);
+    
     await queue.add("file-upload", {
       filename: req.file.originalname,
       destination: req.file.destination,
       path: req.file.path,
-      pdfId: pdfId // Pass the unique ID to the worker
+      textPath: tempTextPath,
+      pdfId: pdfId,
+      pdfType: pdfType
     });
     
     // Store the collection name mapping
     pdfCollections.set(pdfId, {
       filename: req.file.originalname,
-      uploadedAt: new Date().toISOString()
+      uploadedAt: new Date().toISOString(),
+      type: pdfType
     });
     
     return res.json({ 
       message: "File uploaded successfully", 
       file: req.file,
       pdfId: pdfId,
+      pdfType: pdfType,
       status: "Processing started"
     });
   } catch (error) {
@@ -105,6 +187,93 @@ app.post("/upload/pdf", upload.single("pdf"), async (req, res) => {
     return res.status(500).json({ error: "Internal server error" });
   }
 });
+
+// Function to generate a high-quality answer using Gemini
+async function generateEnhancedAnswer(query, context, pageReferences, pdfType, depth = "normal") {
+  try {
+    if (!process.env.GOOGLE_API_KEY) {
+      throw new Error("GOOGLE_API_KEY is not set");
+    }
+
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-2.0-flash",
+      generationConfig: {
+        temperature: depth === "deep" ? 0.3 : 0.1,
+        topK: depth === "deep" ? 40 : 20,
+        topP: depth === "deep" ? 0.95 : 0.9,
+        maxOutputTokens: depth === "deep" ? 4096 : 2048,
+      },
+    });
+    
+    // Determine depth instruction
+    let depthInstruction = "";
+    if (depth === "step-by-step") {
+      depthInstruction = "Provide a detailed, step-by-step explanation. Break down complex concepts into manageable steps with clear transitions between them.";
+    } else if (depth === "deep") {
+      depthInstruction = "Provide a comprehensive, in-depth explanation with detailed examples, analogies, and thorough context.";
+    } else if (depth === "deeper") {
+      depthInstruction = "Provide an extremely detailed, exhaustive explanation covering all aspects, with multiple examples, practical applications, and connections to related concepts.";
+    } else if (depth === "simple") {
+      depthInstruction = "Provide a simple, easy-to-understand explanation. Avoid technical jargon and use everyday language with relatable examples.";
+    } else {
+      depthInstruction = "Provide a clear, direct answer that addresses the specific question.";
+    }
+    
+    // Adjust instruction based on PDF type
+    let typeInstruction = "";
+    if (pdfType === "qa") {
+      typeInstruction = "This document appears to be in a question-answer format. When appropriate, structure your response in a similar Q&A style or clearly address the questions posed in the document.";
+    }
+    
+    const pageRefText = pageReferences.length > 0 
+      ? `This information can be found on pages ${pageReferences.join(', ')}.` 
+      : "";
+    
+    const prompt = `
+      You are an expert educational assistant that provides exceptional answers based on document content.
+
+      DOCUMENT TYPE: ${pdfType}
+      USER QUESTION: "${query}"
+      REQUESTED DEPTH: ${depth}
+
+      DOCUMENT CONTEXT:
+      ${context}
+
+      INSTRUCTIONS:
+      1. ${depthInstruction}
+      2. ${typeInstruction}
+      3. Answer the question based ONLY on the provided document content
+      4. Do not make up information not found in the document
+      5. If the document doesn't contain the answer, say so politely but helpfully
+      6. Write in a natural, engaging, and conversational tone
+      7. Format your response appropriately - use headings, bullet points, or numbered steps when helpful
+      8. Include the page reference: "${pageRefText}"
+
+      IMPORTANT: 
+      - If explaining a process or concept, break it down into logical steps
+      - Use analogies and examples to make complex ideas accessible
+      - For mathematical or technical content, show your work or reasoning process
+      - Adapt your explanation style to match the document's content and structure
+
+      Please provide your enhanced answer:
+    `;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    
+    // Ensure page references are included
+    let finalResponse = response.text();
+    if (pageRefText && !finalResponse.includes(pageRefText)) {
+      finalResponse += `\n\n${pageRefText}`;
+    }
+    
+    return finalResponse;
+  } catch (error) {
+    console.error("Error generating response with Gemini:", error);
+    // Fallback to a simple response
+    return `Based on the document, I found relevant information about "${query}". ${pageReferences.length > 0 ? `This information can be found on pages ${pageReferences.join(', ')}.` : ''}`;
+  }
+}
 
 // Function to extract page numbers from content
 function extractPageNumbers(content) {
@@ -120,30 +289,19 @@ function extractPageNumbers(content) {
   return [...new Set(matches)].sort((a, b) => a - b);
 }
 
-// Function to clean context by removing page references and other noise
-function cleanContext(content) {
-  return content
-    .replace(/\[Page \d+\]/g, '')  // Remove page references
-    .replace(/\.{10,}/g, '')       // Remove sequences of dots
-    .replace(/\s+/g, ' ')          // Normalize whitespace
-    .replace(/undefined/g, '')     // Remove undefined text
-    .replace(/[^\w\s.,!?;:'"-]/g, '') // Remove special characters but keep punctuation
-    .trim();
-}
-
 // Function to filter and rank relevant content
-function filterRelevantContent(content, query) {
+function filterRelevantContent(content, query, pdfType) {
   const sentences = content.split(/[.!?]/).filter(s => s.trim().length > 10);
   const queryKeywords = query.toLowerCase().split(/\s+/);
   
-  // Score sentences based on keyword matches
+  // Score sentences based on keyword matches and relevance
   const scoredSentences = sentences.map(sentence => {
     const lowerSentence = sentence.toLowerCase();
     let score = 0;
     
     // Basic keyword matching
     queryKeywords.forEach(keyword => {
-      if (lowerSentence.includes(keyword)) {
+      if (keyword.length > 3 && lowerSentence.includes(keyword)) {
         score += 3;
       }
     });
@@ -153,12 +311,19 @@ function filterRelevantContent(content, query) {
       score += 10;
     }
     
-    // Bonus for sentence that seems to define the concept
-    if (lowerSentence.startsWith(query.toLowerCase() + " is") || 
+    // Bonus for definition sentences
+    if ((lowerSentence.startsWith(query.toLowerCase() + " is") || 
         lowerSentence.startsWith(query.toLowerCase() + " are") ||
         lowerSentence.includes("is " + query.toLowerCase()) ||
-        lowerSentence.includes("are " + query.toLowerCase())) {
+        lowerSentence.includes("are " + query.toLowerCase()) ||
+        lowerSentence.includes("defined as") ||
+        lowerSentence.includes("refers to"))) {
       score += 15;
+    }
+    
+    // For Q&A documents, prioritize question-answer pairs
+    if (pdfType === "qa" && (lowerSentence.includes("question") || lowerSentence.includes("answer"))) {
+      score += 5;
     }
     
     return { sentence, score };
@@ -170,110 +335,8 @@ function filterRelevantContent(content, query) {
     .sort((a, b) => b.score - a.score)
     .map(item => item.sentence);
   
-  // Return the top 5 most relevant sentences
-  return relevantSentences.slice(0, 5).join(". ") + ".";
-}
-
-// Function to generate a natural, human-like answer using Gemini
-async function generateNaturalAnswer(query, context, pageReferences, depth = "normal") {
-  try {
-    if (!process.env.GOOGLE_API_KEY) {
-      throw new Error("GOOGLE_API_KEY is not set");
-    }
-
-    const model = genAI.getGenerativeModel({ 
-      model: "gemini-pro",
-      generationConfig: {
-        temperature: depth === "deep" ? 0.3 : 0.1,
-        topK: depth === "deep" ? 40 : 20,
-        topP: depth === "deep" ? 0.95 : 0.9,
-        maxOutputTokens: depth === "deep" ? 2048 : 1024,
-      },
-    });
-    
-    // Determine depth instruction
-    let depthInstruction = "";
-    if (depth === "deep") {
-      depthInstruction = "Provide a comprehensive, in-depth explanation with detailed examples and thorough context.";
-    } else if (depth === "deeper") {
-      depthInstruction = "Provide an extremely detailed, exhaustive explanation covering all aspects, with multiple examples and practical applications.";
-    } else {
-      depthInstruction = "Provide a clear, direct answer that addresses the specific question.";
-    }
-    
-    // Create page reference text
-    const pageRefText = pageReferences.length > 0 
-      ? `This information can be found on pages ${pageReferences.join(', ')}.` 
-      : "";
-    
-    const prompt = `
-      You are a helpful assistant that provides accurate answers based on document content.
-
-      USER QUESTION: "${query}"
-
-      DOCUMENT CONTENT:
-      ${context}
-
-      INSTRUCTIONS:
-      1. Answer the user's question in a natural, conversational tone
-      2. Use ONLY the information from the provided document content
-      3. ${depthInstruction}
-      4. If the document doesn't contain the answer, say: "I couldn't find specific information about this in the document. Please try asking about a different topic or rephrasing your question."
-      5. Format your response as a clear, well-structured answer
-      6. Do not mention that you're "based on the document" - just provide the answer directly
-      7. At the end, mention the page references like this: "${pageRefText}"
-
-      IMPORTANT: 
-      - Do not just copy text from the document. Synthesize the information into a coherent answer.
-      - If the document content doesn't directly answer the question, admit it rather than making up an answer.
-
-      Please provide your answer:
-    `;
-
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
-    
-    // Ensure the response includes page references if available
-    let finalResponse = response.text();
-    
-    // Check if the response is a non-answer and improve it
-    if (finalResponse.includes("I couldn't find") || 
-        finalResponse.includes("the document doesn't contain") ||
-        finalResponse.length < 50) {
-      
-      // Try a different approach with a more specific prompt
-      const retryPrompt = `
-        The user asked: "${query}"
-        
-        Here is the relevant content from the document:
-        ${context}
-        
-        Even if the information is not perfect, try to provide the most helpful answer possible based on what's available.
-        If you can infer something from the context, do so but mention it's an inference.
-        If there's truly nothing relevant, say: "I couldn't find specific information about this in the document. 
-        The document seems to focus on other topics. Please try asking about something else."
-      `;
-      
-      const retryResult = await model.generateContent(retryPrompt);
-      const retryResponse = await retryResult.response;
-      finalResponse = retryResponse.text();
-    }
-    
-    // Add page references if they're not already included
-    if (pageRefText && !finalResponse.includes(pageRefText) && !finalResponse.includes("I couldn't find")) {
-      finalResponse += ` ${pageRefText}`;
-    }
-    
-    return finalResponse;
-  } catch (error) {
-    console.error("Error generating response with Gemini:", error);
-    // Fallback to a better response
-    if (pageReferences.length > 0) {
-      return `I found some information about "${query}" in the document. This information can be found on pages ${pageReferences.join(', ')}.`;
-    } else {
-      return `I couldn't find specific information about "${query}" in the document. Please try asking about a different topic.`;
-    }
-  }
+  // Return the top 7 most relevant sentences
+  return relevantSentences.slice(0, 7).join(". ") + ".";
 }
 
 app.post("/chat", async (req, res) => {
@@ -298,6 +361,10 @@ app.post("/chat", async (req, res) => {
       });
     }
 
+    // Get PDF type
+    const pdfData = pdfCollections.get(pdfId);
+    const pdfType = pdfData.type || 'general';
+
     // Initialize embeddings
     const embeddings = new GoogleGenerativeAIEmbeddings({
       apiKey: process.env.GOOGLE_API_KEY,
@@ -312,10 +379,10 @@ app.post("/chat", async (req, res) => {
 
     // Create a retriever to get relevant context
     const retriever = vectorStore.asRetriever({
-      k: 10, // Get more chunks to have better context
+      k: depth === "deep" || depth === "deeper" ? 10 : 7,
       searchType: "similarity",
       searchKwargs: {
-        scoreThreshold: 0.3, // Lower threshold to get more context
+        scoreThreshold: 0.5,
       }
     });
 
@@ -325,7 +392,7 @@ app.post("/chat", async (req, res) => {
     if (results.length === 0) {
       return res.json({
         query,
-        results: `I couldn't find information about "${query}" in this document. Please try asking about something else or check if you've uploaded the right document.`,
+        results: `I couldn't find specific information about "${query}" in this document. The document might focus on different topics. Could you try asking about something else or rephrasing your question?`,
         pageReferences: [],
         count: 0
       });
@@ -337,14 +404,11 @@ app.post("/chat", async (req, res) => {
     // Extract page numbers from the results
     const pageReferences = extractPageNumbers(relevantContent);
     
-    // Clean the context to remove noise
-    const cleanedContext = cleanContext(relevantContent);
-    
-    // Filter for the most relevant content
-    const filteredContext = filterRelevantContent(cleanedContext, query);
+    // Filter for the most relevant content based on PDF type
+    const filteredContext = filterRelevantContent(relevantContent, query, pdfType);
 
-    // Generate a natural answer using Gemini with depth parameter
-    let aiResponse = await generateNaturalAnswer(query, filteredContext, pageReferences, depth || "normal");
+    // Generate a high-quality answer using Gemini
+    let aiResponse = await generateEnhancedAnswer(query, filteredContext, pageReferences, pdfType, depth || "normal");
     
     return res.json({
       query,
@@ -380,19 +444,19 @@ function getSmallTalkResponse(query) {
   const lowerQuery = query.toLowerCase().trim();
   
   if (/^hi$|^hello$|^hey$|^greetings$/.test(lowerQuery)) {
-    return "Hello! I'm here to help you understand your PDF documents. What would you like to know about your document?";
+    return "Hello! I'm your PDF assistant, ready to help you explore and understand your documents. What would you like to know about your PDF?";
   }
   
   if (/^how are you$/.test(lowerQuery)) {
-    return "I'm doing well, thank you! Ready to help you explore your document. What would you like to know?";
+    return "I'm doing great, thanks for asking! I'm ready to help you understand your document. What would you like to explore today?";
   }
   
   if (/^thanks|thank you|thx/.test(lowerQuery)) {
-    return "You're welcome! Is there anything else you'd like to know about your document?";
+    return "You're welcome! I'm glad I could help. Is there anything else you'd like to know about your document?";
   }
   
   if (/^good morning|good afternoon|good evening/.test(lowerQuery)) {
-    return `${query}! How can I help you with your document today?`;
+    return `${query}! It's a great time to learn something new from your document. What would you like to explore?`;
   }
   
   if (/^what's up|sup/.test(lowerQuery)) {
@@ -400,7 +464,7 @@ function getSmallTalkResponse(query) {
   }
   
   if (/^who are you$/.test(lowerQuery)) {
-    return "I'm your PDF assistant, here to help you understand and explore the content of your documents. You can ask me questions about anything in your PDF!";
+    return "I'm your PDF assistant, here to help you understand and explore the content of your documents. You can ask me questions about anything in your PDF, and I'll provide detailed explanations!";
   }
   
   return "How can I help you with your document today?";
@@ -408,4 +472,4 @@ function getSmallTalkResponse(query) {
 
 app.listen(8000, () =>
   console.log(`✅ Server is running on PORT: 8000`)
-);
+)

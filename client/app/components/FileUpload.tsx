@@ -1,7 +1,7 @@
-// app/components/FileUpload.tsx
 'use client';
 
 import React, { useState } from 'react';
+import axios from 'axios';
 
 interface UploadResponse {
   message: string;
@@ -18,6 +18,7 @@ interface FileUploadProps {
 export const FileUpload: React.FC<FileUploadProps> = ({ onPdfUpload, currentPdfId }) => {
   const [isUploading, setIsUploading] = useState(false);
   const [uploadMessage, setUploadMessage] = useState('');
+  const [uploadProgress, setUploadProgress] = useState(0);
   const [pdfId, setPdfId] = useState(currentPdfId || '');
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -30,36 +31,58 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onPdfUpload, currentPdfI
       return;
     }
 
+    // Check file size (max 50MB)
+    if (file.size > 50 * 1024 * 1024) {
+      setUploadMessage('File size exceeds 50MB limit');
+      return;
+    }
+
     setIsUploading(true);
     setUploadMessage('');
+    setUploadProgress(0);
 
     const formData = new FormData();
     formData.append('pdf', file);
 
     try {
-      const response = await fetch('http://localhost:8000/upload/pdf', {
-        method: 'POST',
-        body: formData,
-      });
+      const response = await axios.post<UploadResponse>(
+        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/upload/pdf`, 
+        formData,
+        {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+          onUploadProgress: (progressEvent) => {
+            if (progressEvent.total) {
+              const percentCompleted = Math.round(
+                (progressEvent.loaded * 100) / progressEvent.total
+              );
+              setUploadProgress(percentCompleted);
+            }
+          },
+        }
+      );
 
-      if (response.ok) {
-        const data: UploadResponse = await response.json();
-        setUploadMessage('File uploaded successfully! Processing...');
-        setPdfId(data.pdfId);
-        
-        // Store the PDF ID in localStorage for later use
-        localStorage.setItem('currentPdfId', data.pdfId);
-        localStorage.setItem('currentFilename', file.name);
-        
-        // Notify parent component about the new PDF
-        onPdfUpload(data.pdfId, file.name);
-      } else {
-        const errorData = await response.json();
-        setUploadMessage(`Upload failed: ${errorData.error || 'Please try again.'}`);
-      }
-    } catch (error) {
+      const data = response.data;
+      setUploadMessage('File uploaded successfully! Processing...');
+      setPdfId(data.pdfId);
+      
+      // Store the PDF ID in localStorage for later use
+      localStorage.setItem('currentPdfId', data.pdfId);
+      localStorage.setItem('currentFilename', file.name);
+      
+      // Notify parent component about the new PDF
+      onPdfUpload(data.pdfId, file.name);
+      
+    } catch (error: any) {
       console.error('Upload error:', error);
-      setUploadMessage('Upload error. Please check if the server is running.');
+      if (error.response) {
+        setUploadMessage(`Upload failed: ${error.response.data.error || 'Please try again.'}`);
+      } else if (error.request) {
+        setUploadMessage('Upload error. Please check if the server is running.');
+      } else {
+        setUploadMessage('Upload error. Please try again.');
+      }
     } finally {
       setIsUploading(false);
     }
@@ -126,15 +149,27 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onPdfUpload, currentPdfI
           <span className="text-gray-600">
             {isUploading ? 'Uploading...' : 'Click to upload PDF'}
           </span>
-          <span className="text-xs text-gray-500">(Max size: 10MB)</span>
+          <span className="text-xs text-gray-500">(Max size: 50MB)</span>
         </label>
+        
+        {isUploading && uploadProgress > 0 && (
+          <div className="w-full bg-gray-200 rounded-full h-2.5 mt-4">
+            <div 
+              className="bg-blue-600 h-2.5 rounded-full" 
+              style={{ width: `${uploadProgress}%` }}
+            ></div>
+            <span className="text-xs text-gray-500 mt-1 block">{uploadProgress}%</span>
+          </div>
+        )}
       </div>
       
       {uploadMessage && (
         <div className={`mt-4 p-3 rounded-md ${
-          uploadMessage.includes('successfully') ? 'bg-green-100 text-green-800 border border-green-200' : 
-          uploadMessage.includes('cleared') ? 'bg-yellow-100 text-yellow-800 border border-yellow-200' : 
-          'bg-red-100 text-red-800 border border-red-200'
+          uploadMessage.includes('successfully') || uploadMessage.includes('completed') ? 
+            'bg-green-100 text-green-800 border border-green-200' : 
+          uploadMessage.includes('cleared') ? 
+            'bg-yellow-100 text-yellow-800 border border-yellow-200' : 
+            'bg-red-100 text-red-800 border border-red-200'
         }`}>
           {uploadMessage}
         </div>
@@ -143,8 +178,8 @@ export const FileUpload: React.FC<FileUploadProps> = ({ onPdfUpload, currentPdfI
       <div className="mt-6 text-sm text-gray-500">
         <h3 className="font-medium mb-2">How it works:</h3>
         <ol className="list-decimal pl-5 space-y-1">
-          <li>Upload a PDF file</li>
-          <li>The system will process and index the content</li>
+          <li>Upload a PDF file (max 50MB)</li>
+          <li>The system will process and index the content (takes a few moments)</li>
           <li>Ask questions about the document content</li>
           <li>Get accurate answers with page references</li>
         </ol>

@@ -8,6 +8,7 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import dotenv from 'dotenv';
 import { QdrantClient } from "@qdrant/js-client-rest";
+import Redis from "ioredis";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -89,11 +90,72 @@ const checkQdrantAvailability = async (maxRetries = 5) => {
   throw new Error("Qdrant is not available after multiple attempts");
 };
 
+// Function to test Google Gemini embeddings
+const testGeminiEmbeddings = async (embeddings) => {
+  try {
+    console.log("Testing Gemini embeddings with sample text...");
+    const testText = "This is a test sentence to verify embeddings work correctly.";
+    const testEmbedding = await embeddings.embedQuery(testText);
+    
+    if (!testEmbedding || testEmbedding.length === 0) {
+      throw new Error("Gemini embeddings returned empty vector");
+    }
+    
+    console.log(`Embedding test successful. Vector dimension: ${testEmbedding.length}`);
+    return true;
+  } catch (error) {
+    console.error("Gemini embedding test failed:", error.message);
+    throw error;
+  }
+};
+
+// Function to process documents in smaller batches with retry logic
+const processDocumentsBatch = async (documents, embeddings, collectionName, batchSize = 10) => {
+  for (let i = 0; i < documents.length; i += batchSize) {
+    const batch = documents.slice(i, i + batchSize);
+    console.log(`Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(documents.length / batchSize)}`);
+    
+    let retries = 0;
+    const maxRetries = 3;
+    let success = false;
+    
+    while (retries < maxRetries && !success) {
+      try {
+        await QdrantVectorStore.fromDocuments(
+          batch,
+          embeddings,
+          {
+            url: process.env.QDRANT_URL || "http://localhost:6333",
+            collectionName: collectionName,
+            collectionConfig: {
+              vectors: {
+                size: 768,
+                distance: "Cosine",
+              }
+            }
+          }
+        );
+        success = true;
+        await delay(500); // Small delay between batches
+      } catch (error) {
+        retries++;
+        console.error(`Error processing batch (attempt ${retries}/${maxRetries}):`, error.message);
+        
+        if (retries >= maxRetries) {
+          throw new Error(`Failed to process batch after ${maxRetries} attempts: ${error.message}`);
+        }
+        
+        await delay(2000 * retries); // Exponential backoff
+      }
+    }
+  }
+};
+
 const worker = new Worker(
   "file-upload-queue",
   async (job) => {
     try {
-      console.log(`Processing job ${job.id}: ${job.name}`);
+      console.log(`Processing job ${job.id}: ${job.data.filename}`);
       
       // Check if Qdrant is available before processing
       await checkQdrantAvailability();
@@ -108,7 +170,7 @@ const worker = new Worker(
         throw new Error(`File not found at path: ${job.data.path}`);
       }
 
-      // Load the PDF with metadata to preserve page numbers
+      // Load the PDF
       console.log("Loading PDF...");
       const loader = new PDFLoader(job.data.path, {
         parsedItemSeparator: " ",
@@ -122,12 +184,12 @@ const worker = new Worker(
       
       console.log(`Extracted ${docs.length} pages from PDF`);
 
-      // Split text into chunks while preserving metadata
+      // Text splitting
       console.log("Splitting text into chunks...");
       const textSplitter = new RecursiveCharacterTextSplitter({
-        chunkSize: 500,  // Further reduced chunk size
-        chunkOverlap: 50,
-        separators: ["\n\n", "\n", " ", ""],
+        chunkSize: 1000,
+        chunkOverlap: 200,
+        separators: ["\n\n", "\n", ". ", "! ", "? ", " ", ""],
       });
       
       const chunks = await textSplitter.splitDocuments(docs);
@@ -140,54 +202,20 @@ const worker = new Worker(
         modelName: "embedding-001",
       });
 
-      // Store in Qdrant with PDF-specific collection name
+      // Test embeddings before processing
+      await testGeminiEmbeddings(embeddings);
+
+      // Store in Qdrant
       console.log("Storing vectors in Qdrant...");
       
-      // Process chunks in smaller batches with retry logic
-      const batchSize = 20;  // Smaller batch size
-      const maxRetries = 10; // More retries for Qdrant operations
-      
-      for (let i = 0; i < chunks.length; i += batchSize) {
-        const batch = chunks.slice(i, i + batchSize);
-        console.log(`Processing batch ${Math.floor(i / batchSize) + 1} of ${Math.ceil(chunks.length / batchSize)}`);
-        
-        let retries = 0;
-        let success = false;
-        
-        while (retries < maxRetries && !success) {
-          try {
-            await QdrantVectorStore.fromDocuments(
-              batch,
-              embeddings,
-              {
-                url: process.env.QDRANT_URL || "http://localhost:6333",
-                collectionName: job.data.pdfId,
-              }
-            );
-            success = true;
-            
-            // Add a delay between batches to avoid overloading Qdrant
-            await delay(2000);
-          } catch (error) {
-            retries++;
-            console.error(`Error processing batch (attempt ${retries}/${maxRetries}):`, error.message);
-            
-            if (retries >= maxRetries) {
-              throw error;
-            }
-            
-            // Exponential backoff with longer delays
-            await delay(5000 * retries);
-          }
-        }
-      }
+      // Process in smaller batches with better error handling
+      await processDocumentsBatch(chunks, embeddings, job.data.pdfId, 10);
 
       console.log("Successfully processed PDF and stored vectors using Google Gemini embeddings");
       
       // Clean up unused collections
       await cleanupUnusedCollections(job.data.pdfId);
       
-      // Don't delete the file - keep it for future reference
       console.log("File processed successfully:", job.data.path);
       
       return { success: true, chunks: chunks.length, pdfId: job.data.pdfId };
@@ -204,13 +232,19 @@ const worker = new Worker(
         console.error("Qdrant timeout error. Please check if Qdrant is running and accessible.");
       } else if (error.message.includes('Qdrant is not available')) {
         console.error("Qdrant is not available. Please start Qdrant and try again.");
+      } else if (error.message.includes('ENOENT') || error.message.includes('no such file')) {
+        console.error("File not found. It may have been moved or deleted.");
+      } else if (error.message.includes('Vector dimension error')) {
+        console.error("Embedding generation failed. This might be due to API issues or invalid content.");
+      } else {
+        console.error("Unknown error occurred during PDF processing.");
       }
       
       throw error;
     }
   },
   {
-    concurrency: 1,  // Single concurrency to avoid overloading
+    concurrency: 1,  // Reduce concurrency to 1 to avoid overloading the API
     connection: redisConnection,
     settings: {
       backoffStrategies: {
@@ -223,6 +257,7 @@ const worker = new Worker(
 // Handle worker events
 worker.on("completed", (job) => {
   console.log(`Job ${job.id} completed successfully`);
+  console.log(`Processed ${job.returnvalue.chunks} chunks for PDF ${job.data.pdfId}`);
 });
 
 worker.on("failed", (job, error) => {
@@ -237,6 +272,10 @@ worker.on("failed", (job, error) => {
     console.error("ACTION REQUIRED: Qdrant timeout error. Please check if Qdrant is running.");
   } else if (error.message.includes('Qdrant is not available')) {
     console.error("ACTION REQUIRED: Qdrant is not available. Please start Qdrant and try again.");
+  } else if (error.message.includes('ENOENT') || error.message.includes('no such file')) {
+    console.error("ACTION REQUIRED: File not found. Please check the file path.");
+  } else if (error.message.includes('Vector dimension error')) {
+    console.error("ACTION REQUIRED: Embedding generation failed. Check your Google API key and quota.");
   }
 });
 
@@ -244,4 +283,12 @@ worker.on("error", (error) => {
   console.error("Worker error:", error);
 });
 
-console.log("PDF processing worker started with Google Gemini embeddings");
+worker.on("active", (job) => {
+  console.log(`Job ${job.id} is now active`);
+});
+
+worker.on("stalled", (jobId) => {
+  console.log(`Job ${jobId} has stalled`);
+});
+
+console.log("PDF processing worker started with enhanced error handling");

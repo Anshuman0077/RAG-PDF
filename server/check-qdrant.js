@@ -11,8 +11,8 @@ const qdrantClient = new QdrantClient({
 async function checkQdrant() {
   try {
     const collections = await qdrantClient.getCollections();
-    console.log("Qdrant is available. Collections:", collections.collections.length);
-    process.exit(0);
+    console.log(`Qdrant is available. Collections: ${collections.collections.length}`);
+    return true;
   } catch (error) {
     console.error("Qdrant is not available:", error.message);
     process.exit(1);
