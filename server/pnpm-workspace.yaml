@@ -1,0 +1,3 @@
+ignoredBuiltDependencies:
+  - msgpackr-extract
+  - protobufjs
