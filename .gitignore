@@ -1,3 +1,16 @@
-../server/upload
-server/node_modules
+# frontend node_modules
+/frontend/node_modules
 
+# backend node_modules
+/server/node_modules
+
+# backend uploads folder
+/server/uploads
+
+# build outputs
+/frontend/.next
+/frontend/out
+/server/build
+
+# env files
+*.env
